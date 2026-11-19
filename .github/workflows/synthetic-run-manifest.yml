@@ -1,0 +1,110 @@
+name: Synthetic run manifest composite check
+
+on:
+  push:
+    branches: [ci/manifest-composite-194]
+    paths: [.github/workflows/synthetic-run-manifest.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        exit_code: [0, 17]
+    env:
+      FAKE_CODEX_EXIT: ${{ matrix.exit_code }}
+      EXPECTED_SOURCE_SHA: f587764bd445e7218cb590d53fe2f5d9011e6b5e
+      # Keep the Action's global npm installs off setup-node's executable path.
+      NPM_CONFIG_PREFIX: ${{ github.workspace }}/synthetic-npm-global
+    steps:
+      - name: Check out the PR branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: f587764bd445e7218cb590d53fe2f5d9011e6b5e
+
+      - name: Prepare synthetic child and server-info fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/synthetic-home" "$GITHUB_WORKSPACE/fakebin"
+          printf '{"port":1}\n' > "$GITHUB_WORKSPACE/synthetic-home/${GITHUB_RUN_ID}.json"
+          cat > "$GITHUB_WORKSPACE/fakebin/codex" <<'FAKE_CODEX'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          printf x >> "$GITHUB_WORKSPACE/fake-codex-invocations"
+          cat >/dev/null
+          if [[ "$FAKE_CODEX_EXIT" != 0 ]]; then
+            exit "$FAKE_CODEX_EXIT"
+          fi
+          while (( $# > 0 )); do
+            if [[ "$1" == --output-last-message ]]; then
+              printf 'synthetic result\n' > "$2"
+              exit 0
+            fi
+            shift
+          done
+          exit 30
+          FAKE_CODEX
+          chmod 755 "$GITHUB_WORKSPACE/fakebin/codex"
+          echo "$GITHUB_WORKSPACE/fakebin" >> "$GITHUB_PATH"
+
+      - name: Run the complete local composite Action
+        id: under_test
+        uses: ./
+        continue-on-error: true
+        with:
+          prompt: Synthetic hosted manifest check
+          run-manifest-file: run-manifest.json
+          codex-home: ${{ github.workspace }}/synthetic-home
+          safety-strategy: read-only
+          allow-users: TheOutlandsDev
+
+      - name: Assert synthetic manifest and child lifecycle
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.under_test.outcome }}
+          MANIFEST_OUTPUT: ${{ steps.under_test.outputs.run-manifest-file }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import stat
+
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          import subprocess
+          source_sha = subprocess.check_output(
+              ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+          ).strip()
+          assert source_sha == os.environ["EXPECTED_SOURCE_SHA"]
+          count_file = workspace / "fake-codex-invocations"
+          assert count_file.read_text() == "x", "fake Codex did not run exactly once"
+
+          raw = (workspace / "run-manifest.json").read_text()
+          manifest = json.loads(raw)
+          expected_failure = os.environ["FAKE_CODEX_EXIT"] != "0"
+          expected_outcome = "failed" if expected_failure else "succeeded"
+          expected_action_outcome = "failure" if expected_failure else "success"
+          assert os.environ["ACTION_OUTCOME"] == expected_action_outcome
+          assert manifest["documentType"] == "codex-action.run-manifest"
+          assert manifest["schemaVersion"] == 1
+          assert manifest["outcome"] == expected_outcome
+          assert manifest["promptSource"] == "inline"
+          assert manifest["requestedSafetyStrategy"] == "read-only"
+          assert manifest["requestedLegacySandbox"] is None
+          assert manifest["githubEventSha"] == os.environ["GITHUB_SHA"]
+          assert manifest["durationMs"] >= 0
+          assert "Synthetic hosted manifest check" not in raw
+          assert "synthetic result" not in raw
+          mode = stat.S_IMODE((workspace / "run-manifest.json").stat().st_mode)
+          assert mode == 0o600, oct(mode)
+
+          if not expected_failure:
+              assert os.environ["MANIFEST_OUTPUT"] == "run-manifest.json"
+          PY
